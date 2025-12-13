@@ -28,3 +28,6 @@ Homepage = "https://github.com/your-username/hacvt"
 [tool.setuptools]
 packages = ["hacvt"]
 include-package-data = false
+
+[tool.setuptools.package-data]
+hacvt = ["default_model.json"]

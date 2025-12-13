@@ -1,81 +1,99 @@
 """
-hacvt.model  —  Lightweight HAC-VT sentiment model
+hacvt.model — Lightweight HAC-VT sentiment model
 
 Core usage:
 
     from hacvt import HACVT
 
-    # Train
+    # Option A: Load a packaged default model (plug-and-play)
+    model = HACVT.load_default()
+    print(model.analyze("The car is good, not terrible."))
+
+    # Option B: Train on your own data (labels = ratings 1–5 or 'neg'/'neu'/'pos')
     model = HACVT()
-    model.fit(texts, labels)  # labels = ratings 1–5 or 'neg'/'neu'/'pos'
+    model.fit(texts, labels)
+    print(model.analyze("Not bad at all"))
 
-    # Predict
-    model.predict_one("The car is good, not terrible.")
-    model.predict(["Great engine", "Terrible gearbox"])
-
-    # Save
+    # Save / Load learned model
     json_data = model.to_dict()
-
-    # Load
-    from hacvt import HACVT
     model2 = HACVT.from_dict(json_data)
 """
 
-import re
+import json
 import math
 import random
-from collections import Counter, defaultdict
-from typing import List, Dict, Tuple, Any
+import re
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+# importlib.resources is available in Python 3.8+, but "files" is more reliable with packaged data.
+from importlib import resources
 
 
-# =============== Tokenisation & Negation Handling ===============
+# ============================================================
+# Tokenisation & Negation Handling
+# ============================================================
 
 WORD_RE = re.compile(r"[A-Za-z']+")
 
-NEGATION_WORDS = {
+NEGATION_WORDS: Set[str] = {
     "not", "no", "never", "hardly", "scarcely", "cannot", "can't",
     "isn't", "dont", "don't", "doesnt", "doesn't", "won't", "wont",
     "wouldn't", "shouldn't", "couldn't", "didn't", "aint", "ain't",
     "neither", "nor"
 }
 
-NEGATION_END_TOKENS = {".", ",", ";", "?", "!"}
+# Note: We do not keep punctuation tokens in WORD_RE, so we cannot "see" '.' ',' etc in the token stream.
+# Instead we reset negation at the end of each sentence-like segment by splitting on punctuation first.
+_SENT_SPLIT_RE = re.compile(r"[.!?;]+")
 
 
 def haac_tokenize(text: str) -> List[str]:
     """
     Negation-aware tokeniser used by HAC-VT.
-    Example: "not good at all" → ["NOT_good", "at", "all"]
+
+    Example:
+        "not good at all" -> ["NOT_good", "at", "all"]
+        "I am not happy. great car" -> negation does not leak past the sentence break
     """
-    tokens = WORD_RE.findall(text.lower())
+    if not text:
+        return []
+
     output: List[str] = []
-    negate = False
 
-    for tok in tokens:
-        if tok in NEGATION_WORDS:
-            negate = True
-            continue
+    # Split into segments to prevent negation leaking across sentence-like boundaries.
+    segments = [seg.strip() for seg in _SENT_SPLIT_RE.split(text.lower()) if seg.strip()]
 
-        if negate:
-            output.append(f"NOT_{tok}")
-        else:
-            output.append(tok)
+    for seg in segments:
+        tokens = WORD_RE.findall(seg)
+        negate = False
 
-        if tok in NEGATION_END_TOKENS:
-            negate = False
+        for tok in tokens:
+            if tok in NEGATION_WORDS:
+                negate = True
+                continue
+
+            output.append(f"NOT_{tok}" if negate else tok)
+
+            # Attach negation to the *next* sentiment-bearing token only (as per your design).
+            # After one attachment, stop negating.
+            if negate:
+                negate = False
 
     return output
 
 
-# =============== Likelihoods and Δ-Score ===============
+# ============================================================
+# Likelihoods and Δ-Score
+# ============================================================
 
 def compute_counts(
     texts: List[str],
     labels: List[str],
     classes: Tuple[str, str, str] = ("neg", "neu", "pos"),
 ) -> Tuple[Dict[str, Counter], Dict[str, int]]:
-    counts = {c: Counter() for c in classes}
-    totals = {c: 0 for c in classes}
+    counts: Dict[str, Counter] = {c: Counter() for c in classes}
+    totals: Dict[str, int] = {c: 0 for c in classes}
 
     for text, label in zip(texts, labels):
         toks = haac_tokenize(text)
@@ -89,8 +107,8 @@ def compute_log_likelihoods(
     counts: Dict[str, Counter],
     totals: Dict[str, int],
     alpha: float = 1.0,
-) -> Tuple[Dict[str, Dict[str, float]], set]:
-    vocab = set()
+) -> Tuple[Dict[str, Dict[str, float]], Set[str]]:
+    vocab: Set[str] = set()
     for c in counts:
         vocab.update(counts[c].keys())
 
@@ -114,16 +132,20 @@ def delta_for_tokens(tokens: List[str], log_likelihoods: Dict[str, Dict[str, flo
 def classify_delta(delta: float, tau_low: float, tau_high: float) -> str:
     if delta < tau_low:
         return "neg"
-    elif delta > tau_high:
+    if delta > tau_high:
         return "pos"
-    else:
-        return "neu"
+    return "neu"
 
 
-# =============== Evaluation Helpers ===============
+# ============================================================
+# Evaluation Helpers
+# ============================================================
 
-def macro_f1(true_labels: List[str], pred_labels: List[str],
-             classes: Tuple[str, str, str] = ("neg", "neu", "pos")) -> float:
+def macro_f1(
+    true_labels: List[str],
+    pred_labels: List[str],
+    classes: Tuple[str, str, str] = ("neg", "neu", "pos"),
+) -> float:
     per_class = {c: {"tp": 0, "fp": 0, "fn": 0} for c in classes}
 
     for y, yp in zip(true_labels, pred_labels):
@@ -139,19 +161,13 @@ def macro_f1(true_labels: List[str], pred_labels: List[str],
         fp = per_class[c]["fp"]
         fn = per_class[c]["fn"]
 
-        if tp == 0 and (fp > 0 or fn > 0):
-            f1 = 0.0
-        elif tp == 0 and fp == 0 and fn == 0:
-            f1 = 0.0
-        else:
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            if precision + recall == 0:
-                f1 = 0.0
-            else:
-                f1 = 2 * precision * recall / (precision + recall)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
-        f1_scores.append(f1)
+        if precision + recall == 0.0:
+            f1_scores.append(0.0)
+        else:
+            f1_scores.append(2 * precision * recall / (precision + recall))
 
     return sum(f1_scores) / len(f1_scores)
 
@@ -161,7 +177,7 @@ def train_dev_split(
     labels: List[str],
     dev_ratio: float = 0.2,
     seed: int = 42,
-):
+) -> Tuple[List[str], List[str], List[str], List[str]]:
     indices = list(range(len(texts)))
     rnd = random.Random(seed)
     rnd.shuffle(indices)
@@ -170,7 +186,7 @@ def train_dev_split(
     train_idx = indices[:split]
     dev_idx = indices[split:]
 
-    def subset(idxs, arr):
+    def subset(idxs: List[int], arr: List[Any]) -> List[Any]:
         return [arr[i] for i in idxs]
 
     return (
@@ -187,11 +203,11 @@ def tune_tau(
     classes: Tuple[str, str, str] = ("neg", "neu", "pos"),
     max_abs: float = 10.0,
     step: float = 0.1,
-):
+) -> Tuple[float, float, float]:
     best_f1 = -1.0
     best_t = 0.0
-    steps = int(max_abs / step)
 
+    steps = int(max_abs / step)
     for i in range(steps + 1):
         t = i * step
         tau_low, tau_high = -t, t
@@ -205,7 +221,9 @@ def tune_tau(
     return -best_t, best_t, best_f1
 
 
-# =============== HAC-VT Model Class ===============
+# ============================================================
+# HAC-VT Model Class
+# ============================================================
 
 class HACVT:
     """
@@ -214,28 +232,68 @@ class HACVT:
     Labels can be:
         * numbers 1–5  (1–2=neg, 3=neu, 4–5=pos)
         * strings 'neg', 'neu', 'pos'
+
+    Explicit usage modes:
+        1) Default packaged model:
+            model = HACVT.load_default()
+
+        2) Learned model (dataset-adaptive):
+            model = HACVT().fit(texts, labels)
+
+        3) Loaded learned model:
+            model = HACVT.from_dict(json_data)
     """
 
-    def __init__(self, alpha: float = 1.0,
-                 max_tau: float = 10.0,
-                 tau_step: float = 0.1,
-                 dev_ratio: float = 0.2,
-                 seed: int = 42):
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        max_tau: float = 10.0,
+        tau_step: float = 0.1,
+        dev_ratio: float = 0.2,
+        seed: int = 42,
+    ):
+        # Hyperparameters
         self.alpha = alpha
         self.max_tau = max_tau
         self.tau_step = tau_step
         self.dev_ratio = dev_ratio
         self.seed = seed
 
-        self.classes = ("neg", "neu", "pos")
-        self.log_likelihoods_: Dict[str, Dict[str, float]] | None = None
-        self.vocab_: set | None = None
+        # Model state
+        self.classes: Tuple[str, str, str] = ("neg", "neu", "pos")
+        self.log_likelihoods_: Optional[Dict[str, Dict[str, float]]] = None
+        self.vocab_: Optional[Set[str]] = None
+
+        # Calibration
         self.tau_low_: float = 0.0
         self.tau_high_: float = 0.0
-        self.dev_macro_f1_: float | None = None
+        self.dev_macro_f1_: Optional[float] = None
 
-    # ---------- internal helpers ----------
+    # -------------------------------------------------
+    # Default loader (packaged model)
+    # -------------------------------------------------
+    @classmethod
+    def load_default(cls) -> "HACVT":
+        """
+        Load the packaged default HAC-VT model (plug-and-play).
 
+        This never overrides your learned model. It is only used when explicitly called.
+        """
+        try:
+            default_path = resources.files("hacvt").joinpath("default_model.json")
+            data = json.loads(default_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(
+                "Unable to load default_model.json from the hacvt package. "
+                "Confirm it exists at hacvt/default_model.json and is included in the wheel "
+                "via pyproject.toml package-data."
+            ) from e
+
+        return cls.from_dict(data)
+
+    # -------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------
     @staticmethod
     def _map_label(y: Any) -> str:
         if isinstance(y, str):
@@ -251,16 +309,16 @@ class HACVT:
         if isinstance(y, (int, float)):
             if y <= 2:
                 return "neg"
-            elif int(round(y)) == 3:
+            if int(round(y)) == 3:
                 return "neu"
-            else:
-                return "pos"
+            return "pos"
 
         raise ValueError(f"Unsupported label type: {type(y)}")
 
-    # ---------- training ----------
-
-    def fit(self, texts: List[str], labels: List[Any]):
+    # -------------------------------------------------
+    # Training
+    # -------------------------------------------------
+    def fit(self, texts: List[str], labels: List[Any]) -> "HACVT":
         mapped_labels = [self._map_label(y) for y in labels]
 
         tr_x, tr_y, dev_x, dev_y = train_dev_split(
@@ -272,26 +330,22 @@ class HACVT:
         self.log_likelihoods_ = ll
         self.vocab_ = vocab
 
-        dev_deltas = [
-            delta_for_tokens(haac_tokenize(t), self.log_likelihoods_)
-            for t in dev_x
-        ]
+        dev_deltas = [delta_for_tokens(haac_tokenize(t), self.log_likelihoods_) for t in dev_x]
         tau_low, tau_high, best_f1 = tune_tau(
-            dev_deltas, dev_y, classes=self.classes,
-            max_abs=self.max_tau, step=self.tau_step
+            dev_deltas, dev_y, classes=self.classes, max_abs=self.max_tau, step=self.tau_step
         )
 
         self.tau_low_ = tau_low
         self.tau_high_ = tau_high
         self.dev_macro_f1_ = best_f1
-
         return self
 
-    # ---------- inference ----------
-
+    # -------------------------------------------------
+    # Inference
+    # -------------------------------------------------
     def delta(self, text: str) -> float:
         if self.log_likelihoods_ is None:
-            raise RuntimeError("HAC-VT model is not fitted yet.")
+            raise RuntimeError("HAC-VT model is not fitted/loaded yet. Use fit(), from_dict(), or load_default().")
         toks = haac_tokenize(text)
         return delta_for_tokens(toks, self.log_likelihoods_)
 
@@ -318,11 +372,12 @@ class HACVT:
             "tau_high": self.tau_high_,
         }
 
-    # ---------- serialisation ----------
-
+    # -------------------------------------------------
+    # Serialisation
+    # -------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
-        if self.log_likelihoods_ is None:
-            raise RuntimeError("HAC-VT model is not fitted yet.")
+        if self.log_likelihoods_ is None or self.vocab_ is None:
+            raise RuntimeError("HAC-VT model is not fitted/loaded yet. Cannot serialise.")
 
         return {
             "alpha": self.alpha,
@@ -331,7 +386,7 @@ class HACVT:
             "dev_ratio": self.dev_ratio,
             "seed": self.seed,
             "classes": list(self.classes),
-            "vocab": list(self.vocab_),
+            "vocab": sorted(list(self.vocab_)),
             "log_likelihoods": self.log_likelihoods_,
             "tau_low": self.tau_low_,
             "tau_high": self.tau_high_,
@@ -347,12 +402,10 @@ class HACVT:
             dev_ratio=data.get("dev_ratio", 0.2),
             seed=data.get("seed", 42),
         )
-        obj.classes = tuple(data.get("classes", ["neg", "neu", "pos"]))
+        obj.classes = tuple(data.get("classes", ["neg", "neu", "pos"]))  # type: ignore[assignment]
         obj.vocab_ = set(data.get("vocab", []))
-        obj.log_likelihoods_ = {
-            c: dict(tok_ll) for c, tok_ll in data["log_likelihoods"].items()
-        }
-        obj.tau_low_ = data["tau_low"]
-        obj.tau_high_ = data["tau_high"]
+        obj.log_likelihoods_ = {c: dict(tok_ll) for c, tok_ll in data["log_likelihoods"].items()}
+        obj.tau_low_ = float(data["tau_low"])
+        obj.tau_high_ = float(data["tau_high"])
         obj.dev_macro_f1_ = data.get("dev_macro_f1")
         return obj
