@@ -1,3 +1,4 @@
 prune data
 prune examples
 global-exclude __pycache__ *.pyc *.pyo
+recursive-include hacvt *.json
