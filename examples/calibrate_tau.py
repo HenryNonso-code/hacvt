@@ -3,7 +3,7 @@
 Calibrate tau on a labelled dev set and save a canonical profile.json.
 
 Usage (from repo root):
-  python -m examples.calibrate_tau --dev dev.csv --out profile.json --name MyProfile
+  python -m examples.calibrate_tau --dev dev.csv --out profile.json --name MyProfile --dataset CarReviews
 
 Dev CSV must have columns: text,label
 Labels must be: neg, neu, pos
@@ -13,15 +13,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import Any, Dict, List, Tuple, Optional
 
 from hacvt.calibration import calibrate_tau
 from hacvt.io import save_profile
+from hacvt.model import HACVT
 
 
+# ----------------------------
+# CSV loader (dev set)
+# ----------------------------
 def load_labelled_csv(path: str) -> Tuple[List[str], List[str]]:
     p = Path(path)
     if not p.exists():
@@ -61,20 +66,63 @@ def load_labelled_csv(path: str) -> Tuple[List[str], List[str]]:
     return texts, labels
 
 
-# -------------------------------------------------------------------
-# Replace this later with your REAL HAC-VT decision function.
-# For now, it exists so tau calibration + profile saving is end-to-end.
-# Must return: float decision value (pos_ll - neg_ll style).
-# -------------------------------------------------------------------
-def dummy_decision_fn(text: str) -> float:
-    t = text.lower()
-    if "good" in t or "great" in t or "excellent" in t:
-        return 0.8
-    if "bad" in t or "poor" in t or "terrible" in t:
-        return -0.8
-    return 0.0
+# ----------------------------
+# Load HACVT model once
+# ----------------------------
+def _find_model_path(explicit_path: Optional[str] = None) -> Path:
+    if explicit_path:
+        p = Path(explicit_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Model JSON not found at: {explicit_path}")
+        return p
+
+    candidates = [
+        Path("hacvt_model.json"),
+        Path("hacvt") / "default_model.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    raise FileNotFoundError(
+        "No model JSON found. Expected one of:\n"
+        "  - hacvt_model.json (repo root)\n"
+        "  - hacvt/default_model.json (package)\n"
+        "Or pass --model path/to/model.json"
+    )
 
 
+def load_hacvt_model(model_path: Path) -> HACVT:
+    data = json.loads(model_path.read_text(encoding="utf-8"))
+    return HACVT.from_dict(data)
+
+
+# ----------------------------
+# Decision function (THIS is the key fix)
+# ----------------------------
+def make_decision_fn(model: HACVT):
+    """
+    Returns callable(text)->float decision value used for tau calibration.
+
+    Your HACVT already exposes:
+      - delta(text) -> float  (pos_ll - neg_ll)
+
+    We also support:
+      - decision_value(text) -> float (alias we add to HACVT)
+    """
+    if hasattr(model, "decision_value") and callable(getattr(model, "decision_value")):
+        return lambda text: float(model.decision_value(text))  # type: ignore[attr-defined]
+
+    # fallback to delta()
+    if hasattr(model, "delta") and callable(getattr(model, "delta")):
+        return lambda text: float(model.delta(text))
+
+    raise AttributeError("HACVT model has no decision_value() or delta() method to produce numeric scores.")
+
+
+# ----------------------------
+# Profile builder (canonical)
+# ----------------------------
 def build_profile(
     name: str,
     tau: float,
@@ -82,10 +130,8 @@ def build_profile(
     class_counts: Dict[str, int],
     *,
     dataset: str = "unknown",
+    model_source: str = "unknown",
 ) -> Dict[str, Any]:
-    """
-    Builds a canonical profile object matching the README schema.
-    """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return {
@@ -108,7 +154,8 @@ def build_profile(
             "timestamp_utc": ts,
             "text_col": "text",
             "label_col": "label",
-            "n_dev": int(sum(class_counts.values()))
+            "n_dev": int(sum(class_counts.values())),
+            "model_source": model_source
         },
         "calibration_report": {
             "metric": "macro_f1",
@@ -125,30 +172,37 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="Output profile.json path")
     ap.add_argument("--name", required=True, help="Profile name to store in JSON")
     ap.add_argument("--dataset", default="unknown", help="Dataset name for meta (optional)")
+    ap.add_argument("--model", default=None, help="Optional path to model.json (overrides defaults)")
     args = ap.parse_args()
 
     # 1) Load dev set
     x_dev, y_dev = load_labelled_csv(args.dev)
     counts = Counter(y_dev)
 
-    # 2) Calibrate tau
+    # 2) Load model + numeric decision function
+    model_path = _find_model_path(args.model)
+    model = load_hacvt_model(model_path)
+    decision_fn = make_decision_fn(model)
+
+    # 3) Calibrate tau (tau is symmetric: [-t, +t])
     result = calibrate_tau(
         x_dev=x_dev,
         y_dev=y_dev,
-        decision_fn=dummy_decision_fn,
+        decision_fn=decision_fn,
         metric="macro_f1",
         n_grid=101,
         max_tau=None,
         return_grid=True
     )
 
-    # 3) Build canonical profile + save
+    # 4) Build canonical profile + save
     profile = build_profile(
         name=args.name,
         tau=result.tau,
         dev_macro_f1=result.metric_value,
         class_counts={"neg": counts.get("neg", 0), "neu": counts.get("neu", 0), "pos": counts.get("pos", 0)},
-        dataset=args.dataset
+        dataset=args.dataset,
+        model_source=str(model_path.as_posix())
     )
 
     save_path = save_profile(profile, args.out)
@@ -156,6 +210,7 @@ def main() -> None:
     print("=== Calibrated profile saved ===")
     print(f"Path: {save_path}")
     print(f"Name: {profile['name']}")
+    print(f"Model: {profile['meta'].get('model_source')}")
     print(f"Tau: {profile['tau']:.4f}")
     print(f"Dev Macro-F1: {profile['calibration_report']['dev_macro_f1']:.4f}")
     print(f"Dev counts: {profile['calibration_report']['class_counts_dev']}")

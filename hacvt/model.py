@@ -372,6 +372,15 @@ class HACVT:
             "tau_high": self.tau_high_,
         }
 
+    def decision_value(self, text: str) -> float:
+        """
+        Continuous HAC-VT decision value for tau calibration.
+
+        Definition:
+            decision_value = pos_ll - neg_ll  (same as delta)
+        """
+        return float(self.delta(text))
+
     # -------------------------------------------------
     # Serialisation
     # -------------------------------------------------
