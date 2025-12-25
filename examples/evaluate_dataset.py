@@ -6,8 +6,9 @@ Rule enforced here:
 - If profile has no calibrated tau -> STOP and show:
   "Please calibrate tau using a labelled dev set before evaluation."
 
-This script uses the REAL HACVT model numeric decision value (delta)
-and applies the calibrated tau to produce 3-class predictions.
+This script uses the REAL HACVT model numeric decision value (delta),
+applies OPTIONAL delta centering (delta_mean) if present in the profile,
+and then applies the calibrated tau to produce 3-class predictions.
 """
 
 from __future__ import annotations
@@ -32,11 +33,6 @@ def load_labelled_csv(path: str) -> Tuple[List[str], List[str]]:
     Expects a CSV with headers including at least:
       - text
       - label   (values: neg, neu, pos)
-
-    Example:
-      text,label
-      "Great product",pos
-      "Not good",neg
     """
     p = Path(path)
     if not p.exists():
@@ -99,7 +95,6 @@ def _find_model_path(profile: Dict[str, Any], explicit_path: Optional[str] = Non
         p = Path(ms)
         if p.exists():
             return p
-        # If stored as a posix path from earlier runs, try to interpret relative to repo root too
         p2 = Path(ms.replace("/", "\\"))
         if p2.exists():
             return p2
@@ -163,6 +158,19 @@ def confusion_counts_3x3(y_true: List[str], y_pred: List[str]) -> List[List[int]
     return m
 
 
+def _safe_get_delta_mean(profile: Dict[str, Any]) -> Tuple[float, bool]:
+    """
+    Returns (delta_mean, used_flag).
+    If missing, returns (0.0, False) and evaluation proceeds without centering.
+    """
+    calib = profile.get("calibration_report", {})
+    if isinstance(calib, dict):
+        dm = calib.get("delta_mean", None)
+        if isinstance(dm, (int, float)):
+            return float(dm), True
+    return 0.0, False
+
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -171,13 +179,18 @@ def main() -> None:
     ap.add_argument("--test", required=True, help="Path to labelled test CSV with columns: text,label")
     ap.add_argument("--profile", required=True, help="Path to profile.json")
     ap.add_argument("--model", default=None, help="Optional path to model.json (overrides profile + defaults)")
+    ap.add_argument(
+        "--require-delta-mean",
+        action="store_true",
+        help="If set, fail evaluation unless profile.calibration_report.delta_mean exists.",
+    )
     args = ap.parse_args()
 
     # 1) Load profile
     profile = load_profile(args.profile)
 
     # 2) ENFORCEMENT: require calibrated tau before evaluation
-    tau = require_calibrated_tau(profile)
+    tau = float(require_calibrated_tau(profile))
 
     # 3) Load model (real HACVT) + numeric decision (delta)
     model_path = _find_model_path(profile, args.model)
@@ -186,18 +199,36 @@ def main() -> None:
     # 4) Load test set
     x_test, y_test = load_labelled_csv(args.test)
 
-    # 5) Predict using REAL delta + apply_tau
-    decisions = [float(model.delta(t)) for t in x_test]
-    y_pred = [apply_tau(d, float(tau)) for d in decisions]
+    # 5) Optional centering using delta_mean from profile
+    delta_mean, used_delta_mean = _safe_get_delta_mean(profile)
+    if args.require_delta_mean and not used_delta_mean:
+        raise ValueError(
+            "Profile is missing calibration_report.delta_mean. "
+            "Recalibrate with examples/calibrate_tau.py to save delta_mean."
+        )
 
-    # 6) Report
+    # 6) Predict using REAL delta (optionally centered) + apply_tau
+    decisions_raw = [float(model.delta(t)) for t in x_test]
+    decisions = [(d - delta_mean) for d in decisions_raw] if used_delta_mean else decisions_raw
+    y_pred = [apply_tau(d, tau) for d in decisions]
+
+    # 7) Report
     mf1 = macro_f1_3class(y_test, y_pred)
     cm = confusion_counts_3x3(y_test, y_pred)
 
+    meta = profile.get("meta", {}) if isinstance(profile.get("meta", {}), dict) else {}
+    model_source = meta.get("model_source", str(model_path))
+
     print("=== HAC-VT Evaluation (enforced tau) ===")
     print(f"Profile: {profile.get('name', 'unknown')}")
-    print(f"Model: {profile.get('meta', {}).get('model_source', str(model_path))}")
-    print(f"Tau: {float(tau):.4f}")
+    print(f"Model: {model_source}")
+    print(f"Tau: {tau:.4f}")
+
+    if used_delta_mean:
+        print(f"Delta centering: ON (delta_mean={delta_mean:.4f})")
+    else:
+        print("Delta centering: OFF (delta_mean missing; using raw delta)")
+
     print(f"Macro-F1: {mf1:.4f}")
     print(f"N_test: {len(x_test)}")
     print(_dist_report("Gold distribution", y_test))
