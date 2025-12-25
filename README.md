@@ -23,6 +23,7 @@ print(model.predict_one("The car is good, not terrible."))
 # Full analysis with calibrated neutral band and Δ-score
 print(model.analyze("I am not happy with this engine at all."))
 
+
 ---
 
 ## Profile JSON Schema (Canonical)
@@ -42,6 +43,24 @@ calibration, evaluation, API inference, and dashboard interaction.
   "meta": {},
   "calibration_report": {}
 }
+
+Field definitions
+
+name: Human-readable profile name (e.g. dataset + date)
+
+version: Profile schema version
+
+tau: Calibrated neutral-band threshold (required for dataset evaluation)
+
+label_map: Mapping from sentiment labels to numeric IDs
+
+params: HAC-VT scoring parameters
+
+meta: Dataset metadata and provenance
+
+calibration_report: Calibration metrics and diagnostics
+
+Example profile.json
 {
   "name": "car_reviews_hacvt_2025_12_25",
   "version": "1.0",
@@ -73,5 +92,12 @@ calibration, evaluation, API inference, and dashboard interaction.
   }
 }
 
+Mandatory workflow
 
+Calibrate tau on a labelled development set
 
+Save the resulting profile.json
+
+Evaluate datasets using the calibrated profile
+
+Dataset evaluation without a calibrated tau is not allowed.
