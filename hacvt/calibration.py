@@ -30,11 +30,12 @@ except Exception:  # pragma: no cover
 
 
 # ----------------------------
-# IMPORTANT DEFAULT POLICY
+# DEFAULT POLICY (PRODUCT RULE)
 # ----------------------------
-# This prevents tau exploding on imbalanced dev sets (e.g., very small "neg" class),
-# which can lead to "neutral inflation" and poor generalisation.
+# 1) Prevent tau exploding on imbalanced dev sets (neutral inflation).
 DEFAULT_MAX_TAU: float = 3.0
+# 2) Prevent tau collapsing to 0 (forces a minimal neutral band).
+DEFAULT_MIN_TAU: float = 0.2
 
 
 Label = str
@@ -48,6 +49,7 @@ class TauCalibrationResult:
     metric_value: float
     grid: List[Tuple[float, float]]  # list of (tau, metric_value)
     n_dev: int
+    min_tau_used: float
     max_tau_used: float
 
 
@@ -87,42 +89,52 @@ def _macro_f1(y_true: Sequence[Label], y_pred: Sequence[Label]) -> float:
 
         precision = tp / (tp + fp) if (tp + fp) else 0.0
         recall = tp / (tp + fn) if (tp + fn) else 0.0
-        if precision + recall == 0:
+        if precision + recall == 0.0:
             return 0.0
-        return 2 * precision * recall / (precision + recall)
+        return 2.0 * precision * recall / (precision + recall)
 
-    return sum(prf_for(l) for l in labels) / 3.0
+    return (prf_for("neg") + prf_for("neu") + prf_for("pos")) / 3.0
 
 
 def _make_grid_from_decisions(
     decisions: Sequence[float],
+    *,
     n_grid: int = 101,
     max_tau: Optional[float] = None,
-) -> Tuple[List[float], float]:
+    min_tau: Optional[float] = None,
+) -> Tuple[List[float], float, float]:
     """
-    Create a tau grid using the distribution of |decision|, but WITH an enforced cap.
+    Create a tau grid from [min_tau_used .. max_tau_used].
 
     Policy:
-      - If max_tau is provided, use it.
-      - If max_tau is None, enforce DEFAULT_MAX_TAU.
-
-    Returns:
-      (tau_grid, max_tau_used)
+      - If max_tau is None -> DEFAULT_MAX_TAU
+      - If min_tau is None -> DEFAULT_MIN_TAU
+      - Ensures max_tau_used >= min_tau_used
+      - Returns: (tau_grid, min_tau_used, max_tau_used)
     """
     abs_vals = [abs(d) for d in decisions if d is not None and not math.isnan(d)]
     if not abs_vals:
-        # Degenerate case: all NaN/None decisions; only tau=0 makes sense
-        return [0.0], 0.0
+        # Degenerate case: all NaN/None decisions; fallback to min tau policy if possible
+        min_used = float(DEFAULT_MIN_TAU if min_tau is None else min_tau)
+        min_used = max(0.0, min_used)
+        return [min_used], min_used, min_used
 
-    # Enforce cap
+    min_tau_used = float(DEFAULT_MIN_TAU if min_tau is None else min_tau)
     max_tau_used = float(DEFAULT_MAX_TAU if max_tau is None else max_tau)
+
+    min_tau_used = max(0.0, min_tau_used)
     max_tau_used = max(0.0, max_tau_used)
 
-    if n_grid <= 1 or max_tau_used == 0.0:
-        return [0.0], max_tau_used
+    # Ensure sane ordering
+    if max_tau_used < min_tau_used:
+        max_tau_used = min_tau_used
 
-    step = max_tau_used / (n_grid - 1)
-    return [i * step for i in range(n_grid)], max_tau_used
+    if n_grid <= 1 or math.isclose(max_tau_used, min_tau_used):
+        return [min_tau_used], min_tau_used, max_tau_used
+
+    step = (max_tau_used - min_tau_used) / (n_grid - 1)
+    grid = [min_tau_used + i * step for i in range(n_grid)]
+    return grid, min_tau_used, max_tau_used
 
 
 def calibrate_tau(
@@ -133,29 +145,18 @@ def calibrate_tau(
     metric: str = "macro_f1",
     n_grid: int = 101,
     max_tau: Optional[float] = None,
+    min_tau: Optional[float] = None,
     return_grid: bool = True,
 ) -> TauCalibrationResult:
     """
     Learn tau on a dev set by grid-searching tau values and maximising a metric.
 
-    Parameters
-    ----------
-    x_dev, y_dev:
-        Development texts and gold labels in {"neg","neu","pos"}.
-    decision_fn:
-        Callable that maps text -> decision scalar (e.g., pos_ll - neg_ll).
-    metric:
-        Currently supports "macro_f1" (default).
-    n_grid:
-        Number of tau points to test (default 101).
     max_tau:
-        Manual cap for tau. If None, DEFAULT_MAX_TAU is enforced.
-    return_grid:
-        If True, store full (tau, metric) curve.
+      - manual cap (if None => DEFAULT_MAX_TAU)
+    min_tau:
+      - manual floor (if None => DEFAULT_MIN_TAU) to stop tau collapsing to 0
 
-    Returns
-    -------
-    TauCalibrationResult with best tau and metric.
+    Returns TauCalibrationResult with best tau and metric.
     """
     if len(x_dev) != len(y_dev):
         raise ValueError("x_dev and y_dev must have the same length.")
@@ -164,19 +165,23 @@ def calibrate_tau(
 
     _validate_labels(y_dev)
 
-    # Compute decisions once
-    decisions: List[float] = []
-    for t in x_dev:
-        d = float(decision_fn(t))
-        decisions.append(d)
-
-    # Prepare tau grid (ENFORCED cap)
-    tau_grid, max_tau_used = _make_grid_from_decisions(decisions, n_grid=n_grid, max_tau=max_tau)
-
     if metric.lower() != "macro_f1":
         raise ValueError(f"Unsupported metric: {metric}. Use metric='macro_f1'.")
 
-    best_tau = 0.0
+    # Compute decisions once
+    decisions: List[float] = []
+    for t in x_dev:
+        decisions.append(float(decision_fn(t)))
+
+    # Prepare tau grid with enforced floor and cap
+    tau_grid, min_tau_used, max_tau_used = _make_grid_from_decisions(
+        decisions,
+        n_grid=n_grid,
+        max_tau=max_tau,
+        min_tau=min_tau,
+    )
+
+    best_tau = float(tau_grid[0])
     best_score = -1.0
     curve: List[Tuple[float, float]] = []
 
@@ -198,6 +203,7 @@ def calibrate_tau(
         metric_value=best_score,
         grid=curve if return_grid else [],
         n_dev=len(x_dev),
+        min_tau_used=float(min_tau_used),
         max_tau_used=float(max_tau_used),
     )
 
@@ -210,6 +216,7 @@ def fit_profile_tau(
     *,
     n_grid: int = 101,
     max_tau: Optional[float] = None,
+    min_tau: Optional[float] = None,
 ) -> Tuple[Any, TauCalibrationResult]:
     """
     Convenience wrapper that learns tau and writes it into the provided profile object.
@@ -222,12 +229,12 @@ def fit_profile_tau(
         y_dev=y_dev,
         decision_fn=decision_fn,
         n_grid=n_grid,
-        max_tau=max_tau,  # if None, DEFAULT_MAX_TAU enforced internally
+        max_tau=max_tau,
+        min_tau=min_tau,
         metric="macro_f1",
         return_grid=True,
     )
 
-    # Write into profile
     try:
         setattr(profile, "tau", result.tau)
     except Exception as e:
