@@ -19,7 +19,7 @@ It only needs a way to obtain a decision value per text via a caller-supplied fu
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union, Dict, Any
+from typing import Callable, List, Optional, Sequence, Tuple, Any
 
 import math
 
@@ -27,6 +27,14 @@ try:
     from sklearn.metrics import f1_score
 except Exception:  # pragma: no cover
     f1_score = None
+
+
+# ----------------------------
+# IMPORTANT DEFAULT POLICY
+# ----------------------------
+# This prevents tau exploding on imbalanced dev sets (e.g., very small "neg" class),
+# which can lead to "neutral inflation" and poor generalisation.
+DEFAULT_MAX_TAU: float = 3.0
 
 
 Label = str
@@ -40,6 +48,7 @@ class TauCalibrationResult:
     metric_value: float
     grid: List[Tuple[float, float]]  # list of (tau, metric_value)
     n_dev: int
+    max_tau_used: float
 
 
 def apply_tau(decision_value: float, tau: float) -> Label:
@@ -57,9 +66,7 @@ def _validate_labels(y: Sequence[Label]) -> None:
     allowed = {"neg", "neu", "pos"}
     bad = sorted({v for v in y if v not in allowed})
     if bad:
-        raise ValueError(
-            f"Invalid labels in y_dev: {bad}. Expected only {sorted(allowed)}."
-        )
+        raise ValueError(f"Invalid labels in y_dev: {bad}. Expected only {sorted(allowed)}.")
 
 
 def _macro_f1(y_true: Sequence[Label], y_pred: Sequence[Label]) -> float:
@@ -91,33 +98,31 @@ def _make_grid_from_decisions(
     decisions: Sequence[float],
     n_grid: int = 101,
     max_tau: Optional[float] = None,
-) -> List[float]:
+) -> Tuple[List[float], float]:
     """
-    Create a tau grid using the distribution of |decision|.
-    Default: grid from 0 to percentile-based upper bound.
+    Create a tau grid using the distribution of |decision|, but WITH an enforced cap.
+
+    Policy:
+      - If max_tau is provided, use it.
+      - If max_tau is None, enforce DEFAULT_MAX_TAU.
+
+    Returns:
+      (tau_grid, max_tau_used)
     """
     abs_vals = [abs(d) for d in decisions if d is not None and not math.isnan(d)]
     if not abs_vals:
         # Degenerate case: all NaN/None decisions; only tau=0 makes sense
-        return [0.0]
+        return [0.0], 0.0
 
-    abs_vals_sorted = sorted(abs_vals)
+    # Enforce cap
+    max_tau_used = float(DEFAULT_MAX_TAU if max_tau is None else max_tau)
+    max_tau_used = max(0.0, max_tau_used)
 
-    # Choose an upper bound that is robust to extreme outliers
-    if max_tau is None:
-        # 95th percentile as a reasonable cap
-        idx = int(0.95 * (len(abs_vals_sorted) - 1))
-        upper = abs_vals_sorted[idx]
-    else:
-        upper = float(max_tau)
+    if n_grid <= 1 or max_tau_used == 0.0:
+        return [0.0], max_tau_used
 
-    upper = max(0.0, upper)
-
-    if n_grid <= 1 or upper == 0.0:
-        return [0.0]
-
-    step = upper / (n_grid - 1)
-    return [i * step for i in range(n_grid)]
+    step = max_tau_used / (n_grid - 1)
+    return [i * step for i in range(n_grid)], max_tau_used
 
 
 def calibrate_tau(
@@ -140,13 +145,13 @@ def calibrate_tau(
     decision_fn:
         Callable that maps text -> decision scalar (e.g., pos_ll - neg_ll).
     metric:
-        Currently supports "macro_f1" (default). Easily extendable.
+        Currently supports "macro_f1" (default).
     n_grid:
         Number of tau points to test (default 101).
     max_tau:
-        Optional manual cap for tau. If None, uses ~95th percentile of |decision|.
+        Manual cap for tau. If None, DEFAULT_MAX_TAU is enforced.
     return_grid:
-        If True, store full (tau, metric) curve for reporting/plotting.
+        If True, store full (tau, metric) curve.
 
     Returns
     -------
@@ -165,8 +170,8 @@ def calibrate_tau(
         d = float(decision_fn(t))
         decisions.append(d)
 
-    # Prepare tau grid
-    tau_grid = _make_grid_from_decisions(decisions, n_grid=n_grid, max_tau=max_tau)
+    # Prepare tau grid (ENFORCED cap)
+    tau_grid, max_tau_used = _make_grid_from_decisions(decisions, n_grid=n_grid, max_tau=max_tau)
 
     if metric.lower() != "macro_f1":
         raise ValueError(f"Unsupported metric: {metric}. Use metric='macro_f1'.")
@@ -182,7 +187,7 @@ def calibrate_tau(
         if return_grid:
             curve.append((float(tau), float(score)))
 
-        # Tie-breaker: if same score, prefer smaller tau (more decisive, less neutral inflation)
+        # Tie-breaker: if same score, prefer smaller tau
         if (score > best_score) or (math.isclose(score, best_score) and tau < best_tau):
             best_score = float(score)
             best_tau = float(tau)
@@ -193,6 +198,7 @@ def calibrate_tau(
         metric_value=best_score,
         grid=curve if return_grid else [],
         n_dev=len(x_dev),
+        max_tau_used=float(max_tau_used),
     )
 
 
@@ -216,7 +222,7 @@ def fit_profile_tau(
         y_dev=y_dev,
         decision_fn=decision_fn,
         n_grid=n_grid,
-        max_tau=max_tau,
+        max_tau=max_tau,  # if None, DEFAULT_MAX_TAU enforced internally
         metric="macro_f1",
         return_grid=True,
     )
@@ -225,8 +231,6 @@ def fit_profile_tau(
     try:
         setattr(profile, "tau", result.tau)
     except Exception as e:
-        raise TypeError(
-            "Profile object does not support setting attribute 'tau'."
-        ) from e
+        raise TypeError("Profile object does not support setting attribute 'tau'.") from e
 
     return profile, result
