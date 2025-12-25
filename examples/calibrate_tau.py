@@ -214,6 +214,7 @@ def main() -> None:
     print(f"Tau: {profile['tau']:.4f}")
     print(f"Dev Macro-F1: {profile['calibration_report']['dev_macro_f1']:.4f}")
     print(f"Dev counts: {profile['calibration_report']['class_counts_dev']}")
+    print(f"Tau search range: [{result.min_tau_used:.2f}, {result.max_tau_used:.2f}]")
 
 
 if __name__ == "__main__":
