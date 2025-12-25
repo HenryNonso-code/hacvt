@@ -74,3 +74,43 @@ def load_profile(path: str) -> Dict[str, Any]:
     profile.setdefault("version", "1.0")
 
     return profile
+# =========================
+# Step 3: Tau enforcement helpers
+# =========================
+
+DEFAULT_TAU = 0.15  # used ONLY for quick single-text prediction (clearly labelled)
+
+
+def get_tau_or_default(profile: dict) -> tuple[float, str]:
+    """
+    Quick-prediction helper.
+
+    Returns:
+      (tau_value, tau_source)
+    tau_source is one of: "calibrated", "default"
+
+    Rules:
+    - If profile has a numeric tau -> use it ("calibrated")
+    - Otherwise -> use DEFAULT_TAU ("default")
+    """
+    tau = profile.get("tau", None) if isinstance(profile, dict) else None
+    if isinstance(tau, (int, float)):
+        return float(tau), "calibrated"
+    return float(DEFAULT_TAU), "default"
+
+
+def require_calibrated_tau(profile: dict) -> float:
+    """
+    Dataset-evaluation enforcement.
+
+    MUST be called before any dataset evaluation (test-set scoring).
+    Raises ValueError with the exact message you want to show to users.
+    """
+    if not isinstance(profile, dict):
+        raise TypeError("profile must be a dict loaded from a profile.json")
+
+    tau = profile.get("tau", None)
+    if tau is None or not isinstance(tau, (int, float)):
+        raise ValueError("Please calibrate tau using a labelled dev set before evaluation.")
+
+    return float(tau)
