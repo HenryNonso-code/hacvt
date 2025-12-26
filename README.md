@@ -100,4 +100,18 @@ Save the resulting profile.json
 
 Evaluate datasets using the calibrated profile
 
+!pip install -U git+https://github.com/HenryNonso-code/hacvt.git
+
+from hacvt import predict_text, predict_csv
+
+# 1) Default (no profile needed)
+predict_text("This car is okay", mode="default")
+
+# 2) Calibrated (requires a profile.json)
+predict_text("This car is okay", mode="calibrated", profile_path="profile.json", kappa=0.5)
+
+# 3) CSV batch
+predict_csv("my_data.csv", "my_preds.csv", text_col="text", mode="default")
+
+
 Dataset evaluation without a calibrated tau is not allowed.
