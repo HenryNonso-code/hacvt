@@ -1,23 +1,20 @@
+# hacvt/model.py
 """
-hacvt.model — Lightweight HAC-VT sentiment model
+hacvt.model — Lightweight HAC-VT sentiment model (with confidence gating)
 
-Core usage:
+Public API (module-level) expected by dashboard + external users:
+- log_likelihoods(text): returns total LL for neg/neu/pos
+- best_label_and_margin(text): returns (best_label, margin = best - second_best)
+- predict_one_gated(text, tau, delta_mean=0.0, kappa=0.0): legacy gating on centered delta
+- predict_one_gated_v2(text, tau, delta_mean=0.0, kappa=0.0, delta_bias=0.0, delta_scale=1.0, adapter_path=None):
+    Tier-1 standardization + adapter confidence boost (no polarity shifting)
 
-    from hacvt import HACVT
-
-    # Option A: Load a packaged default model (plug-and-play)
-    model = HACVT.load_default()
-    print(model.analyze("The car is good, not terrible."))
-
-    # Option B: Train on your own data (labels = ratings 1–5 or 'neg'/'neu'/'pos')
-    model = HACVT()
-    model.fit(texts, labels)
-    print(model.analyze("Not bad at all"))
-
-    # Save / Load learned model
-    json_data = model.to_dict()
-    model2 = HACVT.from_dict(json_data)
+Notes:
+- Default model weights are loaded from hacvt/default_model.json (must be packaged).
+- Adapter is a CONFIDENCE modifier only: it boosts margin inside neutral band.
 """
+
+from __future__ import annotations
 
 import json
 import math
@@ -26,7 +23,6 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple, Set
 
-# importlib.resources is available in Python 3.8+, but "files" is more reliable with packaged data.
 from importlib import resources
 
 
@@ -43,8 +39,6 @@ NEGATION_WORDS: Set[str] = {
     "neither", "nor"
 }
 
-# Note: We do not keep punctuation tokens in WORD_RE, so we cannot "see" '.' ',' etc in the token stream.
-# Instead we reset negation at the end of each sentence-like segment by splitting on punctuation first.
 _SENT_SPLIT_RE = re.compile(r"[.!?;]+")
 
 
@@ -60,8 +54,6 @@ def haac_tokenize(text: str) -> List[str]:
         return []
 
     output: List[str] = []
-
-    # Split into segments to prevent negation leaking across sentence-like boundaries.
     segments = [seg.strip() for seg in _SENT_SPLIT_RE.split(text.lower()) if seg.strip()]
 
     for seg in segments:
@@ -75,8 +67,7 @@ def haac_tokenize(text: str) -> List[str]:
 
             output.append(f"NOT_{tok}" if negate else tok)
 
-            # Attach negation to the *next* sentiment-bearing token only (as per your design).
-            # After one attachment, stop negating.
+            # Attach negation to the next token only
             if negate:
                 negate = False
 
@@ -84,7 +75,7 @@ def haac_tokenize(text: str) -> List[str]:
 
 
 # ============================================================
-# Likelihoods and Δ-Score
+# Likelihoods and Scoring
 # ============================================================
 
 def compute_counts(
@@ -232,16 +223,6 @@ class HACVT:
     Labels can be:
         * numbers 1–5  (1–2=neg, 3=neu, 4–5=pos)
         * strings 'neg', 'neu', 'pos'
-
-    Explicit usage modes:
-        1) Default packaged model:
-            model = HACVT.load_default()
-
-        2) Learned model (dataset-adaptive):
-            model = HACVT().fit(texts, labels)
-
-        3) Loaded learned model:
-            model = HACVT.from_dict(json_data)
     """
 
     def __init__(
@@ -252,32 +233,24 @@ class HACVT:
         dev_ratio: float = 0.2,
         seed: int = 42,
     ):
-        # Hyperparameters
         self.alpha = alpha
         self.max_tau = max_tau
         self.tau_step = tau_step
         self.dev_ratio = dev_ratio
         self.seed = seed
 
-        # Model state
         self.classes: Tuple[str, str, str] = ("neg", "neu", "pos")
         self.log_likelihoods_: Optional[Dict[str, Dict[str, float]]] = None
         self.vocab_: Optional[Set[str]] = None
 
-        # Calibration
         self.tau_low_: float = 0.0
         self.tau_high_: float = 0.0
         self.dev_macro_f1_: Optional[float] = None
 
-    # -------------------------------------------------
-    # Default loader (packaged model)
-    # -------------------------------------------------
     @classmethod
     def load_default(cls) -> "HACVT":
         """
-        Load the packaged default HAC-VT model (plug-and-play).
-
-        This never overrides your learned model. It is only used when explicitly called.
+        Loads a pre-trained/default model from hacvt/default_model.json inside the package.
         """
         try:
             default_path = resources.files("hacvt").joinpath("default_model.json")
@@ -285,15 +258,11 @@ class HACVT:
         except Exception as e:
             raise RuntimeError(
                 "Unable to load default_model.json from the hacvt package. "
-                "Confirm it exists at hacvt/default_model.json and is included in the wheel "
-                "via pyproject.toml package-data."
+                "Confirm it exists at hacvt/default_model.json and is included in the wheel."
             ) from e
 
         return cls.from_dict(data)
 
-    # -------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------
     @staticmethod
     def _map_label(y: Any) -> str:
         if isinstance(y, str):
@@ -315,9 +284,9 @@ class HACVT:
 
         raise ValueError(f"Unsupported label type: {type(y)}")
 
-    # -------------------------------------------------
+    # -------------------------
     # Training
-    # -------------------------------------------------
+    # -------------------------
     def fit(self, texts: List[str], labels: List[Any]) -> "HACVT":
         mapped_labels = [self._map_label(y) for y in labels]
 
@@ -340,15 +309,47 @@ class HACVT:
         self.dev_macro_f1_ = best_f1
         return self
 
-    # -------------------------------------------------
-    # Inference
-    # -------------------------------------------------
+    # -------------------------
+    # Core numeric score
+    # -------------------------
     def delta(self, text: str) -> float:
         if self.log_likelihoods_ is None:
-            raise RuntimeError("HAC-VT model is not fitted/loaded yet. Use fit(), from_dict(), or load_default().")
+            raise RuntimeError("Model not fitted/loaded. Use fit(), from_dict(), or load_default().")
         toks = haac_tokenize(text)
-        return delta_for_tokens(toks, self.log_likelihoods_)
+        return float(delta_for_tokens(toks, self.log_likelihoods_))
 
+    def decision_value(self, text: str) -> float:
+        return self.delta(text)
+
+    # -------------------------
+    # Confidence primitives
+    # -------------------------
+    def log_likelihoods(self, text: str) -> Dict[str, float]:
+        """
+        Returns total log-likelihood per class for a text.
+        """
+        if self.log_likelihoods_ is None:
+            raise RuntimeError("Model not fitted/loaded. Use fit(), from_dict(), or load_default().")
+
+        toks = haac_tokenize(text)
+        out: Dict[str, float] = {}
+        for c in ("neg", "neu", "pos"):
+            out[c] = float(sum(self.log_likelihoods_[c].get(t, 0.0) for t in toks))
+        return out
+
+    def best_label_and_margin(self, text: str) -> Tuple[str, float]:
+        """
+        Returns (best_label, margin = best_ll - second_best_ll).
+        """
+        lls = self.log_likelihoods(text)
+        items = sorted(lls.items(), key=lambda kv: kv[1], reverse=True)
+        best_label, best_ll = items[0]
+        second_ll = items[1][1]
+        return best_label, float(best_ll - second_ll)
+
+    # -------------------------
+    # Prediction (original)
+    # -------------------------
     def predict_one(self, text: str) -> str:
         d = self.delta(text)
         return classify_delta(d, self.tau_low_, self.tau_high_)
@@ -356,6 +357,110 @@ class HACVT:
     def predict(self, texts: List[str]) -> List[str]:
         return [self.predict_one(t) for t in texts]
 
+    def predict_one_gated(
+        self,
+        text: str,
+        *,
+        tau: float,
+        delta_mean: float = 0.0,
+        kappa: float = 0.0,
+    ) -> str:
+        """
+        Legacy gating on centered delta (not standardized).
+
+        1) d = delta(text) - delta_mean
+        2) if d outside +/-tau => pos/neg
+        3) if inside => neu unless margin >= kappa, then best_label
+        """
+        d = float(self.delta(text) - float(delta_mean))
+        if d > float(tau):
+            return "pos"
+        if d < -float(tau):
+            return "neg"
+
+        best_label, margin = self.best_label_and_margin(text)
+        if float(margin) >= float(kappa):
+            return best_label
+
+        return "neu"
+
+    # ============================================================
+    # NEW (Step 2): Adapter (confidence-only) + Tier-1 standardization
+    # ============================================================
+
+    def _adapter_delta_adjustment(self, text: str, adapter: Optional[Dict[str, Any]]) -> float:
+        """
+        Returns the raw adapter sum for tokens in this text.
+
+        Adapter shape:
+          adapter = { "token_weights": { "token": weight, ... } }
+
+        IMPORTANT:
+        - Adapter is NOT added into delta/z.
+        - Adapter affects ONLY confidence via margin boost.
+        """
+        if not adapter or not isinstance(adapter, dict):
+            return 0.0
+
+        token_weights = adapter.get("token_weights")
+        if not isinstance(token_weights, dict) or not token_weights:
+            return 0.0
+
+        toks = haac_tokenize(text)
+        s = 0.0
+        for tok in toks:
+            w = token_weights.get(tok)
+            if isinstance(w, (int, float)):
+                s += float(w)
+        return float(s)
+
+    def predict_one_gated_v2(
+        self,
+        text: str,
+        *,
+        tau: float,
+        delta_mean: float = 0.0,
+        kappa: float = 0.0,
+        delta_bias: float = 0.0,
+        delta_scale: float = 1.0,
+        adapter: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Tier-1 + Tier-3 decision rule (safe polarity):
+
+        1) raw = delta(text)
+        2) z = (raw - delta_mean - delta_bias) / delta_scale
+        3) if z outside +/-tau => pos/neg
+        4) else (neutral band):
+             margin' = margin + abs(adapter_sum)
+             if margin' >= kappa => best_label
+             else => neu
+        """
+        raw = float(self.delta(text))
+
+        scale = float(delta_scale)
+        if scale == 0.0:
+            scale = 1.0
+
+        z = (raw - float(delta_mean) - float(delta_bias)) / scale
+
+        if z > float(tau):
+            return "pos"
+        if z < -float(tau):
+            return "neg"
+
+        best_label, margin = self.best_label_and_margin(text)
+        adapter_sum = self._adapter_delta_adjustment(text, adapter)
+        margin_prime = float(margin) + abs(float(adapter_sum))
+
+        if margin_prime >= float(kappa):
+            return best_label
+
+        return "neu"
+
+    # -------------------------
+    # Scoring / analysis
+    # -------------------------
     def score(self, texts: List[str], labels: List[Any]) -> float:
         mapped = [self._map_label(y) for y in labels]
         preds = self.predict(texts)
@@ -364,29 +469,23 @@ class HACVT:
     def analyze(self, text: str) -> Dict[str, Any]:
         d = self.delta(text)
         label = classify_delta(d, self.tau_low_, self.tau_high_)
+        best_label, margin = self.best_label_and_margin(text)
         return {
             "text": text,
-            "delta": d,
+            "delta": float(d),
             "label": label,
             "tau_low": self.tau_low_,
             "tau_high": self.tau_high_,
+            "best_label": best_label,
+            "margin": float(margin),
         }
 
-    def decision_value(self, text: str) -> float:
-        """
-        Continuous HAC-VT decision value for tau calibration.
-
-        Definition:
-            decision_value = pos_ll - neg_ll  (same as delta)
-        """
-        return float(self.delta(text))
-
-    # -------------------------------------------------
+    # -------------------------
     # Serialisation
-    # -------------------------------------------------
+    # -------------------------
     def to_dict(self) -> Dict[str, Any]:
         if self.log_likelihoods_ is None or self.vocab_ is None:
-            raise RuntimeError("HAC-VT model is not fitted/loaded yet. Cannot serialise.")
+            raise RuntimeError("Model not fitted/loaded yet. Cannot serialise.")
 
         return {
             "alpha": self.alpha,
@@ -418,3 +517,99 @@ class HACVT:
         obj.tau_high_ = float(data["tau_high"])
         obj.dev_macro_f1_ = data.get("dev_macro_f1")
         return obj
+
+
+# ============================================================
+# Module-level singleton + public functions (Dashboard API)
+# ============================================================
+
+_DEFAULT_MODEL: Optional[HACVT] = None
+
+def _get_default_model() -> HACVT:
+    """
+    Lazy-load the default HAC-VT model once per process.
+    """
+    global _DEFAULT_MODEL
+    if _DEFAULT_MODEL is None:
+        _DEFAULT_MODEL = HACVT.load_default()
+    return _DEFAULT_MODEL
+
+def _load_adapter_from_path(adapter_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Loads adapter JSON from disk if provided.
+    Expected JSON shape:
+      { "token_weights": { "token": weight, ... } }
+    """
+    if not adapter_path:
+        return None
+    try:
+        with open(adapter_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        # Fail safe: adapter is optional; do not crash predictions
+        return None
+
+def log_likelihoods(text: str) -> Dict[str, float]:
+    """
+    Public API: total log-likelihoods for neg/neu/pos.
+    """
+    return _get_default_model().log_likelihoods(text)
+
+def best_label_and_margin(text: str) -> Tuple[str, float]:
+    """
+    Public API: (best_label, margin).
+    """
+    return _get_default_model().best_label_and_margin(text)
+
+def predict_one_gated(
+    text: str,
+    tau: float,
+    delta_mean: float = 0.0,
+    kappa: float = 0.0,
+) -> str:
+    """
+    Public API: legacy gating using centered delta (not standardized).
+    """
+    return _get_default_model().predict_one_gated(
+        text,
+        tau=float(tau),
+        delta_mean=float(delta_mean),
+        kappa=float(kappa),
+    )
+
+def predict_one_gated_v2(
+    text: str,
+    tau: float,
+    delta_mean: float = 0.0,
+    delta_bias: float = 0.0,
+    delta_scale: float = 1.0,
+    kappa: float = 0.0,
+    adapter_path: Optional[str] = None,
+) -> str:
+    """
+    Public API: Tier-1 standardization + adapter confidence boost.
+
+    Adapter affects ONLY confidence (margin boost) inside the neutral band.
+    """
+    adapter = _load_adapter_from_path(adapter_path)
+    return _get_default_model().predict_one_gated_v2(
+        text,
+        tau=float(tau),
+        delta_mean=float(delta_mean),
+        kappa=float(kappa),
+        delta_bias=float(delta_bias),
+        delta_scale=float(delta_scale),
+        adapter=adapter,
+    )
+
+
+__all__ = [
+    "HACVT",
+    "haac_tokenize",
+    "log_likelihoods",
+    "best_label_and_margin",
+    "predict_one_gated",
+    "predict_one_gated_v2",
+    "macro_f1",
+]
