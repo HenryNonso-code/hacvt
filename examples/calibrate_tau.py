@@ -17,7 +17,7 @@ import json
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Callable
 
 from hacvt.calibration import calibrate_tau
 from hacvt.io import save_profile
@@ -98,26 +98,43 @@ def load_hacvt_model(model_path: Path) -> HACVT:
 
 
 # ----------------------------
-# Decision function (THIS is the key fix)
+# Decision function (numeric) + centering
 # ----------------------------
-def make_decision_fn(model: HACVT):
-    """
-    Returns callable(text)->float decision value used for tau calibration.
+DecisionFn = Callable[[str], float]
 
-    Your HACVT already exposes:
+
+def make_raw_decision_fn(model: HACVT) -> DecisionFn:
+    """
+    Returns callable(text)->float decision value.
+
+    Preferred:
+      - decision_value(text) -> float
       - delta(text) -> float  (pos_ll - neg_ll)
-
-    We also support:
-      - decision_value(text) -> float (alias we add to HACVT)
     """
-    if hasattr(model, "decision_value") and callable(getattr(model, "decision_value")):
-        return lambda text: float(model.decision_value(text))  # type: ignore[attr-defined]
+    dv = getattr(model, "decision_value", None)
+    if callable(dv):
+        return lambda text: float(dv(text))
 
-    # fallback to delta()
-    if hasattr(model, "delta") and callable(getattr(model, "delta")):
-        return lambda text: float(model.delta(text))
+    dl = getattr(model, "delta", None)
+    if callable(dl):
+        return lambda text: float(dl(text))
 
     raise AttributeError("HACVT model has no decision_value() or delta() method to produce numeric scores.")
+
+
+def compute_mean(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def make_centered_decision_fn(raw_fn: DecisionFn, delta_mean: float) -> DecisionFn:
+    """
+    Center the decision values so that "neutral" tends to sit near 0.
+
+    delta_centered = delta_raw - mean(delta_raw on dev set)
+    """
+    return lambda text: float(raw_fn(text) - delta_mean)
 
 
 # ----------------------------
@@ -131,8 +148,12 @@ def build_profile(
     *,
     dataset: str = "unknown",
     model_source: str = "unknown",
+    delta_mean: float = 0.0,
+    calibration_policy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    policy = dict(calibration_policy) if calibration_policy else {}
 
     return {
         "name": name,
@@ -146,7 +167,11 @@ def build_profile(
                 "negation_scope": 3
             },
             "scoring": {
-                "decision_rule": "pos_ll_minus_neg_ll"
+                "decision_rule": "pos_ll_minus_neg_ll",
+                "centering": {
+                    "enabled": True,
+                    "method": "dev_mean_subtraction"
+                }
             }
         },
         "meta": {
@@ -161,7 +186,9 @@ def build_profile(
             "metric": "macro_f1",
             "dev_macro_f1": float(dev_macro_f1),
             "tau_grid_size": 101,
-            "class_counts_dev": dict(class_counts)
+            "class_counts_dev": dict(class_counts),
+            "delta_mean": float(delta_mean),
+            "policy": policy
         }
     }
 
@@ -179,42 +206,78 @@ def main() -> None:
     x_dev, y_dev = load_labelled_csv(args.dev)
     counts = Counter(y_dev)
 
-    # 2) Load model + numeric decision function
+    # 2) Load model + raw numeric decision function
     model_path = _find_model_path(args.model)
     model = load_hacvt_model(model_path)
-    decision_fn = make_decision_fn(model)
+    raw_decision_fn = make_raw_decision_fn(model)
 
-    # 3) Calibrate tau (tau is symmetric: [-t, +t])
+    # 3) Compute raw decisions ON DEV, then mean-center them
+    raw_decisions: List[float] = [float(raw_decision_fn(t)) for t in x_dev]
+    delta_mean = compute_mean(raw_decisions)
+    centered_decision_fn = make_centered_decision_fn(raw_decision_fn, delta_mean)
+
+    # 4) Calibrate tau using CENTERED decisions
     result = calibrate_tau(
         x_dev=x_dev,
         y_dev=y_dev,
-        decision_fn=decision_fn,
+        decision_fn=centered_decision_fn,
         metric="macro_f1",
         n_grid=101,
         max_tau=None,
+        min_tau=None,
         return_grid=True
     )
 
-    # 4) Build canonical profile + save
+    # 5) Pull optional range fields safely (depends on your current hacvt/calibration.py)
+    policy: Dict[str, Any] = {}
+    for attr in ("min_tau_used", "max_tau_used"):
+        if hasattr(result, attr):
+            val = getattr(result, attr)
+            if isinstance(val, (int, float)):
+                policy[attr] = float(val)
+
+    # If you later add these fields to TauCalibrationResult, we will store + print them too
+    for attr in ("max_neutral_rate_used", "neutral_penalty_used", "neutral_rate_at_best"):
+        if hasattr(result, attr):
+            val = getattr(result, attr)
+            if isinstance(val, (int, float)):
+                policy[attr] = float(val)
+
+    # 6) Build canonical profile + save (includes delta_mean)
     profile = build_profile(
         name=args.name,
-        tau=result.tau,
-        dev_macro_f1=result.metric_value,
+        tau=float(result.tau),
+        dev_macro_f1=float(result.metric_value),
         class_counts={"neg": counts.get("neg", 0), "neu": counts.get("neu", 0), "pos": counts.get("pos", 0)},
         dataset=args.dataset,
-        model_source=str(model_path.as_posix())
+        model_source=str(model_path.as_posix()),
+        delta_mean=delta_mean,
+        calibration_policy=policy,
     )
 
     save_path = save_profile(profile, args.out)
 
+    # 7) Log
     print("=== Calibrated profile saved ===")
     print(f"Path: {save_path}")
     print(f"Name: {profile['name']}")
     print(f"Model: {profile['meta'].get('model_source')}")
+    print(f"Delta mean (dev): {profile['calibration_report']['delta_mean']:.4f}")
     print(f"Tau: {profile['tau']:.4f}")
     print(f"Dev Macro-F1: {profile['calibration_report']['dev_macro_f1']:.4f}")
     print(f"Dev counts: {profile['calibration_report']['class_counts_dev']}")
-    print(f"Tau search range: [{result.min_tau_used:.2f}, {result.max_tau_used:.2f}]")
+
+    if "min_tau_used" in policy and "max_tau_used" in policy:
+        print(f"Tau search range: [{policy['min_tau_used']:.2f}, {policy['max_tau_used']:.2f}]")
+    elif "max_tau_used" in policy:
+        print(f"Tau search max cap: {policy['max_tau_used']:.2f}")
+
+    if "max_neutral_rate_used" in policy:
+        print(f"Neutral cap used: {policy['max_neutral_rate_used']:.2f}")
+    if "neutral_penalty_used" in policy:
+        print(f"Neutral penalty used: {policy['neutral_penalty_used']:.2f}")
+    if "neutral_rate_at_best" in policy:
+        print(f"Neutral rate at best tau (dev): {policy['neutral_rate_at_best']:.3f}")
 
 
 if __name__ == "__main__":
