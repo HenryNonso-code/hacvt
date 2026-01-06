@@ -11,6 +11,7 @@ Inputs:
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, Dict, List, Tuple
@@ -27,6 +28,9 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 REPO_ROOT = Path(__file__).resolve().parent
 TEST_CSV = REPO_ROOT / "test.csv"   # you already have this file
 OUT_CSV = REPO_ROOT / "Table_5_1_Master_Comparison.csv"
+
+# This file exists in your repo (we saw it in your directory listing)
+DEFAULT_MODEL_JSON = REPO_ROOT / "default_model.json"
 
 LABELS = ["neg", "neu", "pos"]
 
@@ -64,7 +68,6 @@ def avg_time_ms_per_review(
     """
     Average inference time per review in ms.
     """
-    # warmup
     for _ in range(warmup):
         _ = predict_fn(texts)
 
@@ -94,7 +97,6 @@ def build_master_table(
         r_macro = recall_score(y_true, y_pred, labels=LABELS, average="macro", zero_division=0)
         f1_macro = f1_score(y_true, y_pred, labels=LABELS, average="macro", zero_division=0)
 
-        # Neutral F1 only
         f1_neu = f1_score(y_true, y_pred, labels=["neu"], average=None, zero_division=0)[0]
 
         t_ms = avg_time_ms_per_review(predict_fn, texts, n_runs=3, warmup=1)
@@ -109,8 +111,7 @@ def build_master_table(
             "Time (ms/review)": t_ms,
         })
 
-    df = pd.DataFrame(rows).sort_values("Macro-F1", ascending=False).reset_index(drop=True)
-    return df
+    return pd.DataFrame(rows).sort_values("Macro-F1", ascending=False).reset_index(drop=True)
 
 
 # -----------------------------
@@ -159,14 +160,34 @@ def textblob_predict_batch(texts: List[str]) -> List[str]:
     return out
 
 
+def _is_hacvt_loaded(model) -> bool:
+    """
+    Conservative check: if calling delta() on a tiny string raises the
+    'not fitted/loaded' RuntimeError, then it's not loaded.
+    """
+    try:
+        _ = model.delta("ok")
+        return True
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "not fitted" in msg or "not fitted/loaded" in msg or "use fit" in msg:
+            return False
+        # other runtime errors should surface
+        raise
+
+
 def _load_hacvt_model():
     """
     Load HAC-VT model from hacvt.model WITHOUT assuming class name.
     Auto-detects a class with predict_one() or predict().
+    Then GUARANTEES it's loaded using:
+      1) load_default()
+      2) from_dict(state) from default_model.json
     """
     import inspect
     import hacvt.model as hm
 
+    # 1) find candidate model classes
     candidates = []
     for name, obj in hm.__dict__.items():
         if inspect.isclass(obj) and obj.__module__ == hm.__name__:
@@ -174,9 +195,7 @@ def _load_hacvt_model():
                 candidates.append((name, obj))
 
     if not candidates:
-        raise ImportError(
-            "Could not find a model class in hacvt.model with predict_one() or predict()."
-        )
+        raise ImportError("Could not find a model class in hacvt.model with predict_one() or predict().")
 
     preferred_names = ["HACVT", "HACVTModel", "HACVTClassifier", "Model", "HACVTCore"]
     candidates_sorted = sorted(
@@ -186,24 +205,48 @@ def _load_hacvt_model():
 
     chosen_name, ModelCls = candidates_sorted[0]
     model = ModelCls()
-
-    if hasattr(model, "load_default"):
-        model.load_default()
-    elif hasattr(model, "from_dict"):
-        model.from_dict()
-    else:
-        raise RuntimeError(
-            "HAC-VT model class found, but no load_default() or from_dict() method available."
-        )
-
     print(f"[HAC-VT] Using model class from hacvt.model: {chosen_name}")
+
+    # 2) attempt load_default()
+    if hasattr(model, "load_default"):
+        try:
+            model.load_default()
+        except Exception as e:
+            print(f"[HAC-VT] load_default() raised: {type(e).__name__}: {e}")
+
+    # 3) if still not loaded, try from_dict(state) using default_model.json
+    if not _is_hacvt_loaded(model):
+        if not DEFAULT_MODEL_JSON.exists():
+            raise FileNotFoundError(
+                f"HAC-VT is not loaded after load_default(), and {DEFAULT_MODEL_JSON} is missing.\n"
+                f"Fix: ensure default_model.json is present at repo root or update DEFAULT_MODEL_JSON path."
+            )
+
+        if not hasattr(model, "from_dict"):
+            raise RuntimeError(
+                "HAC-VT is not loaded after load_default(), and model has no from_dict(state) method."
+            )
+
+        with open(DEFAULT_MODEL_JSON, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        # Many implementations expect from_dict(state)
+        model.from_dict(state)
+
+        # final check
+        if not _is_hacvt_loaded(model):
+            raise RuntimeError(
+                "Tried load_default() and from_dict(default_model.json) but HAC-VT still reports not fitted/loaded.\n"
+                "Fix: open hacvt/model.py and confirm load_default()/from_dict correctly sets the learned state "
+                "(e.g., token counts, priors, tau, etc.)."
+            )
+
     return model
 
 
 def hacvt_predict_batch(texts: List[str]) -> List[str]:
     """
-    Calls HAC-VT model from hacvt.model using auto-detected class.
-    Normalises output labels to: neg / neu / pos
+    Uses HAC-VT model and normalises output labels to: neg / neu / pos
     """
     model = _load_hacvt_model()
 
@@ -224,10 +267,7 @@ def hacvt_predict_batch(texts: List[str]) -> List[str]:
         elif y in ["positive", "pos"]:
             preds.append("pos")
         else:
-            raise ValueError(
-                f"Unexpected HAC-VT label output: {y!r}\n"
-                f"Fix: map the model output to neg/neu/pos in hacvt_predict_batch()."
-            )
+            raise ValueError(f"Unexpected HAC-VT label output: {y!r}")
 
     return preds
 
@@ -252,7 +292,6 @@ def main():
     texts = df[text_col].astype(str).tolist()
     y_true = df[label_col].astype(str).str.lower().tolist()
 
-    # Basic label sanity
     allowed = set(LABELS)
     bad = sorted(set(y_true) - allowed)
     if bad:
@@ -273,7 +312,6 @@ def main():
 
     table = build_master_table(y_true=y_true, texts=texts, model_predict_fns=model_predict_fns)
 
-    # Print summary
     with pd.option_context("display.max_columns", None, "display.width", 160):
         print("\nMaster Comparison Table:")
         print(table)
