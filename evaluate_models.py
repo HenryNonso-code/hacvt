@@ -162,9 +162,7 @@ def textblob_predict_batch(texts: List[str]) -> List[str]:
 def _load_hacvt_model():
     """
     Load HAC-VT model from hacvt.model WITHOUT assuming class name.
-
-    We auto-detect a class defined in hacvt.model that implements
-    predict_one() or predict() and instantiate it.
+    Auto-detects a class with predict_one() or predict().
     """
     import inspect
     import hacvt.model as hm
@@ -177,11 +175,9 @@ def _load_hacvt_model():
 
     if not candidates:
         raise ImportError(
-            "Could not find a model class in hacvt.model with predict_one() or predict().\n"
-            "Fix: open hacvt/model.py and confirm the exported class and method names."
+            "Could not find a model class in hacvt.model with predict_one() or predict()."
         )
 
-    # Prefer common naming patterns if present
     preferred_names = ["HACVT", "HACVTModel", "HACVTClassifier", "Model", "HACVTCore"]
     candidates_sorted = sorted(
         candidates,
@@ -190,17 +186,17 @@ def _load_hacvt_model():
 
     chosen_name, ModelCls = candidates_sorted[0]
     model = ModelCls()
-if hasattr(model, "load_default"):
-    model.load_default()
-elif hasattr(model, "from_dict"):
-    model.from_dict()
-else:
-    raise RuntimeError(
-        "HAC-VT model class found, but no load_default() or from_dict() method available."
-    )
+
+    if hasattr(model, "load_default"):
+        model.load_default()
+    elif hasattr(model, "from_dict"):
+        model.from_dict()
+    else:
+        raise RuntimeError(
+            "HAC-VT model class found, but no load_default() or from_dict() method available."
+        )
 
     print(f"[HAC-VT] Using model class from hacvt.model: {chosen_name}")
-
     return model
 
 
