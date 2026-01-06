@@ -190,6 +190,14 @@ def _load_hacvt_model():
 
     chosen_name, ModelCls = candidates_sorted[0]
     model = ModelCls()
+if hasattr(model, "load_default"):
+    model.load_default()
+elif hasattr(model, "from_dict"):
+    model.from_dict()
+else:
+    raise RuntimeError(
+        "HAC-VT model class found, but no load_default() or from_dict() method available."
+    )
 
     print(f"[HAC-VT] Using model class from hacvt.model: {chosen_name}")
 
