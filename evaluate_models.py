@@ -55,8 +55,12 @@ def find_text_and_label_columns(df: pd.DataFrame) -> Tuple[str, str]:
     return text_col, label_col
 
 
-def avg_time_ms_per_review(predict_fn: Callable[[List[str]], List[str]], texts: List[str],
-                           n_runs: int = 3, warmup: int = 1) -> float:
+def avg_time_ms_per_review(
+    predict_fn: Callable[[List[str]], List[str]],
+    texts: List[str],
+    n_runs: int = 3,
+    warmup: int = 1
+) -> float:
     """
     Average inference time per review in ms.
     """
@@ -75,8 +79,11 @@ def avg_time_ms_per_review(predict_fn: Callable[[List[str]], List[str]], texts: 
     return (avg_seconds / max(len(texts), 1)) * 1000.0
 
 
-def build_master_table(y_true: List[str], texts: List[str],
-                       model_predict_fns: Dict[str, Callable[[List[str]], List[str]]]) -> pd.DataFrame:
+def build_master_table(
+    y_true: List[str],
+    texts: List[str],
+    model_predict_fns: Dict[str, Callable[[List[str]], List[str]]]
+) -> pd.DataFrame:
     rows = []
 
     for name, predict_fn in model_predict_fns.items():
@@ -152,26 +159,59 @@ def textblob_predict_batch(texts: List[str]) -> List[str]:
     return out
 
 
+def _load_hacvt_model():
+    """
+    Load HAC-VT model from hacvt.model WITHOUT assuming class name.
+
+    We auto-detect a class defined in hacvt.model that implements
+    predict_one() or predict() and instantiate it.
+    """
+    import inspect
+    import hacvt.model as hm
+
+    candidates = []
+    for name, obj in hm.__dict__.items():
+        if inspect.isclass(obj) and obj.__module__ == hm.__name__:
+            if hasattr(obj, "predict_one") or hasattr(obj, "predict"):
+                candidates.append((name, obj))
+
+    if not candidates:
+        raise ImportError(
+            "Could not find a model class in hacvt.model with predict_one() or predict().\n"
+            "Fix: open hacvt/model.py and confirm the exported class and method names."
+        )
+
+    # Prefer common naming patterns if present
+    preferred_names = ["HACVT", "HACVTModel", "HACVTClassifier", "Model", "HACVTCore"]
+    candidates_sorted = sorted(
+        candidates,
+        key=lambda x: (0 if x[0] in preferred_names else 1, x[0])
+    )
+
+    chosen_name, ModelCls = candidates_sorted[0]
+    model = ModelCls()
+
+    print(f"[HAC-VT] Using model class from hacvt.model: {chosen_name}")
+
+    return model
+
+
 def hacvt_predict_batch(texts: List[str]) -> List[str]:
     """
-    Calls your HAC-VT model from hacvt.model.
-    This function is written to be robust: it tries common method names.
+    Calls HAC-VT model from hacvt.model using auto-detected class.
+    Normalises output labels to: neg / neu / pos
     """
-    from hacvt.model import HACVTModel
-
-    model = HACVTModel()  # should load default config/model assets
+    model = _load_hacvt_model()
 
     preds = []
     for t in texts:
-        # Try common prediction methods
         if hasattr(model, "predict_one"):
             y = model.predict_one(str(t))
         elif hasattr(model, "predict"):
             y = model.predict(str(t))
         else:
-            raise AttributeError("HACVTModel has no predict_one() or predict() method.")
+            raise AttributeError("Detected HAC-VT model class has no predict_one() or predict() method.")
 
-        # Normalise to expected labels
         y = str(y).strip().lower()
         if y in ["negative", "neg"]:
             preds.append("neg")
@@ -180,8 +220,10 @@ def hacvt_predict_batch(texts: List[str]) -> List[str]:
         elif y in ["positive", "pos"]:
             preds.append("pos")
         else:
-            # If your model returns numeric class ids, map them here
-            raise ValueError(f"Unexpected HAC-VT label output: {y!r}")
+            raise ValueError(
+                f"Unexpected HAC-VT label output: {y!r}\n"
+                f"Fix: map the model output to neg/neu/pos in hacvt_predict_batch()."
+            )
 
     return preds
 
@@ -192,9 +234,13 @@ def hacvt_predict_batch(texts: List[str]) -> List[str]:
 def main():
     print("=== HAC-VT Master Comparison Table — Step A.3 ===")
     print("Repo root:", REPO_ROOT)
+    print("Python:", sys.version.split()[0])
 
     if not TEST_CSV.exists():
-        raise FileNotFoundError(f"Missing {TEST_CSV}. Put your test split CSV at repo root or update TEST_CSV path.")
+        raise FileNotFoundError(
+            f"Missing {TEST_CSV}.\n"
+            f"Put your test split CSV at repo root or update TEST_CSV path."
+        )
 
     df = pd.read_csv(TEST_CSV)
     text_col, label_col = find_text_and_label_columns(df)
