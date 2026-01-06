@@ -260,6 +260,7 @@ except NameError:
 
 model = _HACVT_CACHED_MODEL
 
+
     preds = []
     for t in texts:
         if hasattr(model, "predict_one"):
