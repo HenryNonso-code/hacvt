@@ -30,7 +30,7 @@ TEST_CSV = REPO_ROOT / "test.csv"   # you already have this file
 OUT_CSV = REPO_ROOT / "Table_5_1_Master_Comparison.csv"
 
 # This file exists in your repo (we saw it in your directory listing)
-DEFAULT_MODEL_JSON = REPO_ROOT / "default_model.json"
+DEFAULT_MODEL_JSON = REPO_ROOT / "hacvt" / "default_model.json"
 
 LABELS = ["neg", "neu", "pos"]
 
