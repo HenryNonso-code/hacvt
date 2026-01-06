@@ -32,6 +32,7 @@ OUT_CSV = REPO_ROOT / "Table_5_1_Master_Comparison.csv"
 # This file exists in your repo (we saw it in your directory listing)
 DEFAULT_MODEL_JSON = REPO_ROOT / "hacvt" / "default_model.json"
 
+
 LABELS = ["neg", "neu", "pos"]
 
 
@@ -179,13 +180,22 @@ def _is_hacvt_loaded(model) -> bool:
 def _load_hacvt_model():
     """
     Load HAC-VT model from hacvt.model WITHOUT assuming class name.
-    Auto-detects a class with predict_one() or predict().
-    Then GUARANTEES it's loaded using:
-      1) load_default()
-      2) from_dict(state) from default_model.json
+    IMPORTANT: In this repo, load_default() and from_dict(...) RETURN a new model,
+    so we must assign the returned object.
     """
     import inspect
+    import json
     import hacvt.model as hm
+
+    def _is_loaded(m) -> bool:
+        try:
+            _ = m.delta("ok")
+            return True
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "not fitted" in msg or "not fitted/loaded" in msg or "use fit" in msg:
+                return False
+            raise
 
     # 1) find candidate model classes
     candidates = []
@@ -204,42 +214,35 @@ def _load_hacvt_model():
     )
 
     chosen_name, ModelCls = candidates_sorted[0]
-    model = ModelCls()
     print(f"[HAC-VT] Using model class from hacvt.model: {chosen_name}")
 
-    # 2) attempt load_default()
-    if hasattr(model, "load_default"):
+    # 2) Try class-level load_default() that RETURNS a model
+    if hasattr(ModelCls, "load_default"):
         try:
-            model.load_default()
+            model = ModelCls.load_default()
+            if _is_loaded(model):
+                return model
         except Exception as e:
-            print(f"[HAC-VT] load_default() raised: {type(e).__name__}: {e}")
+            print(f"[HAC-VT] ModelCls.load_default() raised: {type(e).__name__}: {e}")
 
-    # 3) if still not loaded, try from_dict(state) using default_model.json
-    if not _is_hacvt_loaded(model):
-        if not DEFAULT_MODEL_JSON.exists():
-            raise FileNotFoundError(
-                f"HAC-VT is not loaded after load_default(), and {DEFAULT_MODEL_JSON} is missing.\n"
-                f"Fix: ensure default_model.json is present at repo root or update DEFAULT_MODEL_JSON path."
-            )
+    # 3) Fall back to from_dict(default_model.json) that RETURNS a model
+    default_path = REPO_ROOT / "hacvt" / "default_model.json"
+    if not default_path.exists():
+        raise FileNotFoundError(f"Missing default_model.json at: {default_path}")
 
-        if not hasattr(model, "from_dict"):
-            raise RuntimeError(
-                "HAC-VT is not loaded after load_default(), and model has no from_dict(state) method."
-            )
+    with open(default_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
 
-        with open(DEFAULT_MODEL_JSON, "r", encoding="utf-8") as f:
-            state = json.load(f)
+    if not hasattr(ModelCls, "from_dict"):
+        raise RuntimeError("Model class has no from_dict(data) method.")
 
-        # Many implementations expect from_dict(state)
-        model.from_dict(state)
+    model = ModelCls.from_dict(state)
 
-        # final check
-        if not _is_hacvt_loaded(model):
-            raise RuntimeError(
-                "Tried load_default() and from_dict(default_model.json) but HAC-VT still reports not fitted/loaded.\n"
-                "Fix: open hacvt/model.py and confirm load_default()/from_dict correctly sets the learned state "
-                "(e.g., token counts, priors, tau, etc.)."
-            )
+    if not _is_loaded(model):
+        raise RuntimeError(
+            "Tried load_default() and from_dict(hacvt/default_model.json) but HAC-VT still reports not fitted/loaded.\n"
+            "Fix: confirm from_dict sets the learned state used by delta()."
+        )
 
     return model
 
@@ -248,7 +251,14 @@ def hacvt_predict_batch(texts: List[str]) -> List[str]:
     """
     Uses HAC-VT model and normalises output labels to: neg / neu / pos
     """
-    model = _load_hacvt_model()
+    # Cache the model so we don't reload it repeatedly during timing runs
+global _HACVT_CACHED_MODEL
+try:
+    _HACVT_CACHED_MODEL
+except NameError:
+    _HACVT_CACHED_MODEL = _load_hacvt_model()
+
+model = _HACVT_CACHED_MODEL
 
     preds = []
     for t in texts:
